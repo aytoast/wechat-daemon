@@ -1,0 +1,17 @@
+# ignore build outputs and config files
+bin/
+obj/
+*.exe
+*.pdb
+sidekick_config.txt
+.env
+chat_history/
+crash_log.txt
+profiles/
+artifacts/runtime/
+artifacts/scratch/
+artifacts/logs/*.log
+artifacts/logs/server_*.txt
+__pycache__/
+*.pyc
+scripts/insights_tmp/
