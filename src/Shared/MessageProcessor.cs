@@ -273,9 +273,8 @@ namespace WeChatSidekick
 
         private static string GetRecordKey(string item)
         {
-            string stripped = StripPrefix(item);
-            if (IsHiddenMetadata(item)) return "metadata:" + stripped;
-            return "message:" + stripped;
+            if (item == null) return "";
+            return IsHiddenMetadata(item) ? "metadata:" + item : "message:" + item;
         }
 
         /// <summary>

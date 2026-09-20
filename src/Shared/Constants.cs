@@ -11,6 +11,11 @@ namespace WeChatSidekick
         // timing
         public const int TimerIntervalMs = 15;
         public const int ChatSwitchCooldownMs = 300;
+        public const int NightBackfillStartHour = 1;
+        public const int NightBackfillEndHour = 6;
+        public const int NightBackfillIdleMinutes = 5;
+        public const int NightBackfillMaxPagesPerChat = 80;
+        public const int NightBackfillSettleMs = 250;
 
         // window dimensions
         public const double SidekickWidth = 360;

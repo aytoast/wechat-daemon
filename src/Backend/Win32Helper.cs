@@ -37,6 +37,13 @@ namespace WeChatSidekick
             public RECT rcNormalPosition;
         }
 
+        [StructLayout(LayoutKind.Sequential)]
+        private struct LASTINPUTINFO
+        {
+            public uint cbSize;
+            public uint dwTime;
+        }
+
         [DllImport("user32.dll")]
         [return: MarshalAs(UnmanagedType.Bool)]
         public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
@@ -50,11 +57,45 @@ namespace WeChatSidekick
 
         [DllImport("user32.dll")]
         [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
         public static extern bool GetWindowPlacement(IntPtr hWnd, ref WINDOWPLACEMENT lpwndpl);
 
         [DllImport("user32.dll")]
         [return: MarshalAs(UnmanagedType.Bool)]
         public static extern bool SetForegroundWindow(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetCursorPos(out POINT lpPoint);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool SetCursorPos(int x, int y);
+
+        [DllImport("user32.dll")]
+        private static extern void mouse_event(uint dwFlags, uint dx, uint dy, int dwData, UIntPtr dwExtraInfo);
+
+        private const uint MouseEventWheel = 0x0800;
+
+        [DllImport("user32.dll")]
+        public static extern bool SetProcessDPIAware();
+        [DllImport("user32.dll")]
+        public static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int width, int height, uint flags);
+        [DllImport("user32.dll")]
+        public static extern bool SetWindowPlacement(IntPtr hwnd, ref WINDOWPLACEMENT placement);
+        [DllImport("user32.dll")]
+        public static extern short GetAsyncKeyState(int key);
+
+        public static RECT VisibleScreenPart(RECT target)
+        {
+            var area = System.Windows.Forms.Screen.FromRectangle(new Rectangle(target.Left, target.Top,
+                Math.Max(1, target.Right - target.Left), 1)).WorkingArea;
+            return new RECT { Left = Math.Max(target.Left, area.Left), Top = Math.Max(target.Top, area.Top),
+                Right = Math.Min(target.Right, area.Right), Bottom = Math.Min(target.Bottom, area.Bottom) };
+        }
 
         [DllImport("user32.dll", SetLastError = true)]
         public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
@@ -149,6 +190,72 @@ namespace WeChatSidekick
             return WindowAttachmentHelper.IsForegroundProcess("Weixin", "sidekick");
         }
 
+        public static bool HasBeenIdleFor(TimeSpan duration)
+        {
+            try
+            {
+                LASTINPUTINFO input = new LASTINPUTINFO();
+                input.cbSize = (uint)Marshal.SizeOf(typeof(LASTINPUTINFO));
+                if (!GetLastInputInfo(ref input)) return false;
+                uint elapsedMs = unchecked((uint)Environment.TickCount - input.dwTime);
+                return elapsedMs >= duration.TotalMilliseconds;
+            }
+            catch { }
+            return false;
+        }
+
+        public static bool ScrollMouseWheelUp(RECT target)
+        {
+            for (int i = 0; i < 3; i++)
+                if (!ScrollMouseWheel(target, 360)) return false;
+            return true;
+        }
+
+        public static bool ClickAt(int x, int y)
+        {
+            if (!SetCursorPos(x, y)) return false;
+            mouse_event(2, 0, 0, 0, UIntPtr.Zero);
+            mouse_event(4, 0, 0, 0, UIntPtr.Zero);
+            System.Threading.Thread.Sleep(500);
+            return true;
+        }
+
+        public static bool ScrollMouseWheelDown(RECT target)
+        {
+            for (int i = 0; i < 3; i++)
+                if (!ScrollMouseWheel(target, -3600)) return false;
+            return true;
+        }
+
+        public static bool ScrollSessionListDown(RECT target)
+        {
+            return ScrollMouseWheel(target, -120);
+        }
+
+        private static bool ScrollMouseWheel(RECT target, int delta)
+        {
+            target = VisibleScreenPart(target);
+            if (target.Right <= target.Left || target.Bottom <= target.Top) return false;
+            POINT original;
+            if (!GetCursorPos(out original)) return false;
+            try
+            {
+                int x = target.Left + (target.Right - target.Left) / 2;
+                int y = target.Top + (target.Bottom - target.Top) / 2;
+                if (!SetCursorPos(x, y)) return false;
+                mouse_event(MouseEventWheel, 0, 0, delta, UIntPtr.Zero);
+                // Qt consumes wheel input asynchronously; retain target until dispatched.
+                System.Threading.Thread.Sleep(150);
+                return true;
+            }
+            catch { }
+            finally
+            {
+                SetCursorPos(original.x, original.y);
+            }
+            return false;
+        }
+
         public static bool IsWeChatWindow(IntPtr hwnd)
         {
             try
@@ -187,6 +294,9 @@ namespace WeChatSidekick
         public static bool? IsMessageFromMe(ScreenCapture cap, RECT rect)
         {
             if (cap == null || cap.Bmp == null) return null;
+            // Screen pixels outside physical capture cannot establish sender identity.
+            if (rect.Top < cap.ScreenY || rect.Bottom > cap.ScreenY + cap.Bmp.Height
+                || rect.Left < cap.ScreenX || rect.Right > cap.ScreenX + cap.Bmp.Width) return null;
 
             int w = rect.Right - rect.Left;
             int h = rect.Bottom - rect.Top;

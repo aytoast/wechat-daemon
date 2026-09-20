@@ -11,11 +11,19 @@ namespace WeChatSidekick.Backend
     public static class DaemonApiService
     {
         private static readonly JavaScriptSerializer Serializer = new JavaScriptSerializer();
+        private static readonly string RecordsDir = ResolveRecordsDir();
         private const string ApiPrefix = "/wechat/daemon";
         private static readonly HashSet<string> VisibleTypes = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "", "message" };
         private const int SnapshotKeepCount = 10;
 
-        public static bool IngestVisibleState(string chatName, List<string> visibleMessages)
+        public static List<string> GetSavedMessages(string chatName)
+        {
+            var result = new List<string>();
+            foreach (var record in LoadChat(GetContactDir(chatName))) result.Add(GetString(record, "Text"));
+            return result;
+        }
+
+        public static bool IngestVisibleState(string chatName, List<string> visibleMessages, bool completeBackfill = false, bool preservedPrefix = false)
         {
             if (string.IsNullOrWhiteSpace(chatName) || visibleMessages == null || visibleMessages.Count == 0)
             {
@@ -24,8 +32,6 @@ namespace WeChatSidekick.Backend
 
             string contactDir = GetContactDir(chatName);
             if (!Directory.Exists(contactDir)) Directory.CreateDirectory(contactDir);
-            EnsureInfoFile(contactDir, chatName);
-
             List<Dictionary<string, object>> stored = LoadChat(contactDir);
             List<string> storedText = new List<string>();
             foreach (Dictionary<string, object> record in stored)
@@ -33,7 +39,36 @@ namespace WeChatSidekick.Backend
                 storedText.Add(GetString(record, "Text"));
             }
 
-            List<string> mergedText = MessageProcessor.SelfCorrect(MessageProcessor.MergeMessages(storedText, visibleMessages, false));
+            List<string> mergedText;
+            if (completeBackfill)
+            {
+                // Never discard older records if desktop history is incomplete.
+                int matched = 0;
+                var dates = new List<DateTime>();
+                foreach (var record in stored)
+                {
+                    DateTime capturedAt;
+                    if (!DateTime.TryParse(GetString(record, "CapturedAt"), out capturedAt)) capturedAt = DateTime.Now;
+                    dates.Add(capturedAt);
+                }
+                // Anchored reconciliation already carries historical labels with their
+                // original provenance. Do not reinterpret that prefix as today's UI.
+                mergedText = preservedPrefix ? new List<string>(visibleMessages)
+                    : Reconciliation.PreserveSeparators(storedText, dates, visibleMessages, DateTime.Now);
+                for (int i = 0; i < mergedText.Count; i++)
+                {
+                    if (matched >= storedText.Count) continue;
+                    DateTime capturedAt;
+                    bool same = mergedText[i] == storedText[matched] || (DateTime.TryParse(GetString(stored[matched], "CapturedAt"), out capturedAt)
+                        ? Reconciliation.SameRecord(storedText[matched], capturedAt, mergedText[i], DateTime.Now)
+                        : MessageProcessor.StripPrefix(mergedText[i]) == MessageProcessor.StripPrefix(storedText[matched]));
+                    if (!same) continue;
+                    if (MessageProcessor.HasSenderPrefix(storedText[matched])) mergedText[i] = storedText[matched];
+                    matched++;
+                }
+                if (matched != storedText.Count) throw new InvalidOperationException("Backfill conflicts with saved history; records preserved.");
+            }
+            else mergedText = MessageProcessor.MergeMessages(storedText, visibleMessages, false);
             if (MessageProcessor.ListsAreEqual(storedText, mergedText))
             {
                 return false;
@@ -44,6 +79,7 @@ namespace WeChatSidekick.Backend
             foreach (Dictionary<string, object> record in stored)
             {
                 string text = GetString(record, "Text");
+                if (completeBackfill) text = MessageProcessor.StripPrefix(text);
                 if (!existingByText.ContainsKey(text))
                 {
                     existingByText[text] = new Queue<Dictionary<string, object>>();
@@ -55,9 +91,10 @@ namespace WeChatSidekick.Backend
             foreach (string text in mergedText)
             {
                 Dictionary<string, object> existing = null;
-                if (existingByText.ContainsKey(text) && existingByText[text].Count > 0)
+                string key = completeBackfill ? MessageProcessor.StripPrefix(text) : text;
+                if (existingByText.ContainsKey(key) && existingByText[key].Count > 0)
                 {
-                    existing = existingByText[text].Dequeue();
+                    existing = existingByText[key].Dequeue();
                 }
 
                 if (existing != null)
@@ -120,9 +157,9 @@ namespace WeChatSidekick.Backend
                     {
                         { "ok", true },
                         { "name", "wechat-daemon-api" },
-                        { "profilesDir", GetProfilesDir() },
+                        { "recordsDir", GetProfilesDir() },
                         { "sidecars", BuildSidecarStatus() },
-                        { "endpoints", new[] { "GET /jobs", "GET /jobs/{id}", "POST /jobs/{id}/result", "GET /contacts", "GET /contacts/{contact}", "GET /contacts/{contact}/chat-history", "DELETE /contacts/{contact}/chat-history", "PUT /contacts/{contact}/profile", "PATCH /contacts/{contact}/insight" } }
+                        { "endpoints", new[] { "GET /contacts", "GET /contacts/{contact}", "GET /contacts/{contact}/chat-history", "DELETE /contacts/{contact}/chat-history" } }
                     });
                     return true;
                 }
@@ -130,6 +167,12 @@ namespace WeChatSidekick.Backend
                 if (path.Equals(ApiPrefix + "/contacts", StringComparison.OrdinalIgnoreCase))
                 {
                     WriteJson(context, BuildContactsList());
+                    return true;
+                }
+
+                if (path.Equals(ApiPrefix + "/todos", StringComparison.OrdinalIgnoreCase))
+                {
+                    WriteError(context, 410, "todos belong to Sidekick.");
                     return true;
                 }
 
@@ -163,25 +206,13 @@ namespace WeChatSidekick.Backend
 
                     if (suffix.EndsWith("/profile", StringComparison.OrdinalIgnoreCase))
                     {
-                        string contact = DecodePath(suffix.Substring(0, suffix.Length - "/profile".Length));
-                        if (!StringEquals(context.Request.HttpMethod, "PUT"))
-                        {
-                            WriteError(context, 405, "method not allowed.");
-                            return true;
-                        }
-                        SaveContactProfile(context, contact);
+                        WriteError(context, 410, "profiles belong to Sidekick.");
                         return true;
                     }
 
                     if (suffix.EndsWith("/insight", StringComparison.OrdinalIgnoreCase))
                     {
-                        string contact = DecodePath(suffix.Substring(0, suffix.Length - "/insight".Length));
-                        if (!StringEquals(context.Request.HttpMethod, "PATCH"))
-                        {
-                            WriteError(context, 405, "method not allowed.");
-                            return true;
-                        }
-                        UpdateContactInsight(context, contact);
+                        WriteError(context, 410, "insights belong to Sidekick.");
                         return true;
                     }
 
@@ -197,34 +228,11 @@ namespace WeChatSidekick.Backend
                     }
                 }
 
-                if (path.Equals(ApiPrefix + "/jobs", StringComparison.OrdinalIgnoreCase))
-                {
-                    WriteJson(context, BuildJobsList());
-                    return true;
-                }
-
                 string jobsPrefix = ApiPrefix + "/jobs/";
-                if (path.StartsWith(jobsPrefix, StringComparison.OrdinalIgnoreCase))
+                if (path.Equals(ApiPrefix + "/jobs", StringComparison.OrdinalIgnoreCase)
+                    || path.StartsWith(jobsPrefix, StringComparison.OrdinalIgnoreCase))
                 {
-                    string suffix = path.Substring(jobsPrefix.Length);
-                    if (suffix.EndsWith("/result", StringComparison.OrdinalIgnoreCase))
-                    {
-                        string jobId = suffix.Substring(0, suffix.Length - "/result".Length);
-                        if (!StringEquals(context.Request.HttpMethod, "POST"))
-                        {
-                            WriteError(context, 405, "method not allowed.");
-                            return true;
-                        }
-                        ApplyJobResult(context, DecodePath(jobId));
-                        return true;
-                    }
-
-                    if (!StringEquals(context.Request.HttpMethod, "GET"))
-                    {
-                        WriteError(context, 405, "method not allowed.");
-                        return true;
-                    }
-                    WriteJson(context, BuildJobDetail(DecodePath(suffix)));
+                    WriteError(context, 410, "semantic jobs belong to Sidekick.");
                     return true;
                 }
 
@@ -276,6 +284,19 @@ namespace WeChatSidekick.Backend
                         { "threadCount", GetThreads(info).Count }
                     });
                 }
+
+                if (insights.Count > 0 && GetString(info, "todoExtractionVersion") != "1")
+                {
+                    jobs.Add(new Dictionary<string, object>
+                    {
+                        { "id", "todos:" + contact },
+                        { "type", "todo_extraction" },
+                        { "contact", contact },
+                        { "reason", "extract_open_commitments" },
+                        { "insightCount", insights.Count },
+                        { "todoCount", GetTodos(info).Count }
+                    });
+                }
             }
 
             return new Dictionary<string, object>
@@ -293,13 +314,11 @@ namespace WeChatSidekick.Backend
             }
 
             string contactDir = GetContactDir(contact);
-            Dictionary<string, object> info = LoadInfo(contactDir);
             List<Dictionary<string, object>> chat = LoadChat(contactDir);
 
             return new Dictionary<string, object>
             {
                 { "contact", contact },
-                { "wechatid", GetString(info, "wechatid") },
                 { "messages", chat }
             };
         }
@@ -312,29 +331,10 @@ namespace WeChatSidekick.Backend
             }
 
             string contactDir = GetContactDir(contact);
-            Dictionary<string, object> info = LoadInfo(contactDir);
-            if (info.Count == 0)
-            {
-                return new Dictionary<string, object>
-                {
-                    { "contact", contact },
-                    { "nickname", contact },
-                    { "wechatid", "" },
-                    { "profile", new Dictionary<string, object>() },
-                    { "insights", new object[0] },
-                    { "threads", new object[0] }
-                };
-            }
-
-            EnsureInsightIds(info, contactDir);
             return new Dictionary<string, object>
             {
                 { "contact", contact },
-                { "nickname", GetString(info, "nickname") },
-                { "wechatid", GetString(info, "wechatid") },
-                { "profile", GetProfile(info) },
-                { "insights", GetInsights(info) },
-                { "threads", GetThreads(info) }
+                { "recordCount", LoadChat(contactDir).Count }
             };
         }
 
@@ -347,7 +347,6 @@ namespace WeChatSidekick.Backend
 
             string contactDir = GetContactDir(contact);
             if (!Directory.Exists(contactDir)) Directory.CreateDirectory(contactDir);
-            EnsureInfoFile(contactDir, contact);
             SnapshotContact(contactDir, "chat_clear");
             SaveChat(contactDir, new List<Dictionary<string, object>>());
         }
@@ -374,6 +373,7 @@ namespace WeChatSidekick.Backend
             if (!info.ContainsKey("nickname")) info["nickname"] = contact;
             if (!info.ContainsKey("wechatid")) info["wechatid"] = "";
             if (!info.ContainsKey("insights")) info["insights"] = new object[0];
+            if (!info.ContainsKey("todos")) info["todos"] = new object[0];
             if (!info.ContainsKey("threads")) info["threads"] = new object[0];
             info["profile"] = profile;
 
@@ -463,6 +463,7 @@ namespace WeChatSidekick.Backend
             Dictionary<string, object> info = LoadInfo(contactDir);
             List<Dictionary<string, object>> pending = GetPendingVisibleRecords(chat);
             List<Dictionary<string, object>> insights = GetInsights(info);
+            List<Dictionary<string, object>> todos = GetTodos(info);
             List<Dictionary<string, object>> threads = GetThreads(info);
 
             if (type == "consolidate")
@@ -499,6 +500,33 @@ namespace WeChatSidekick.Backend
                 };
             }
 
+            if (type == "todos")
+            {
+                return new Dictionary<string, object>
+                {
+                    { "id", jobId },
+                    { "type", "todo_extraction" },
+                    { "contact", contact },
+                    { "reason", "extract_open_commitments" },
+                    { "existingInsights", insights },
+                    { "existingTodos", todos },
+                    { "resultSchema", new Dictionary<string, object>
+                        {
+                            { "newTodos", new[] { new Dictionary<string, object>
+                                {
+                                    { "title", "concrete action for 我" },
+                                    { "status", "open|done|cancelled" },
+                                    { "dueDate", "yyyy-mm-dd or empty" },
+                                    { "sourceInsightIds", new string[0] },
+                                    { "sourceRecordIds", new string[0] }
+                                }
+                            } },
+                            { "resolveTodoIds", new string[0] }
+                        }
+                    }
+                };
+            }
+
             List<Dictionary<string, object>> nearbyInsights = new List<Dictionary<string, object>>();
             int takeFrom = Math.Max(0, insights.Count - 5);
             for (int i = takeFrom; i < insights.Count; i++)
@@ -515,6 +543,7 @@ namespace WeChatSidekick.Backend
                 { "profile", GetProfile(info) },
                 { "records", pending },
                 { "existingInsights", nearbyInsights },
+                { "existingTodos", todos },
                 { "semanticRouting", GetSemanticRoutingRules() },
                 { "resultSchema", new Dictionary<string, object>
                     {
@@ -525,9 +554,25 @@ namespace WeChatSidekick.Backend
                                 { "category", "职业与项目|生活与近况|偏好与兴趣|资源与合作|随便聊聊|忽略" },
                                 { "date", "yyyy-mm-dd; infer from source record CapturedAt when present" },
                                 { "sourceRecordIds", new string[0] },
-                                { "highlightRecordIds", new string[0] }
+                                { "highlightRecordIds", new string[0] },
+                                { "mentionedEntities", new[] { new Dictionary<string, object>
+                                    {
+                                        { "name", "person, organization, or group named in source records" },
+                                        { "kind", "person|organization|group" }
+                                    }
+                                } }
                             }
                         } },
+                        { "newTodos", new[] { new Dictionary<string, object>
+                            {
+                                { "title", "concrete action for 我; omit if no action is owed" },
+                                { "status", "open|done|cancelled" },
+                                { "dueDate", "yyyy-mm-dd or empty" },
+                                { "sourceInsightIds", new string[0] },
+                                { "sourceRecordIds", new string[0] }
+                            }
+                        } },
+                        { "resolveTodoIds", new string[0] },
                         { "markRecordIdsProcessed", new string[0] },
                         { "markRecordIdsSkipped", new string[0] },
                         { "profileUpdates", new Dictionary<string, object>() }
@@ -586,6 +631,12 @@ namespace WeChatSidekick.Backend
                 return;
             }
 
+            if (type == "todos")
+            {
+                ApplyTodoResult(context, contact, contactDir, info, result);
+                return;
+            }
+
             HashSet<string> replaceIds = ToStringSet(GetArray(result, "replaceInsightIds"));
             if (replaceIds.Count > 0)
             {
@@ -632,6 +683,7 @@ namespace WeChatSidekick.Backend
                 insights.Add(insight);
             }
             info["insights"] = insights;
+            ApplyTodoChanges(info, result);
 
             Dictionary<string, object> profile = GetDictionary(info, "profile");
             if (profile == null)
@@ -686,6 +738,7 @@ namespace WeChatSidekick.Backend
                 { "contact", contact },
                 { "type", "review" },
                 { "addedInsights", acceptedInsights.Count },
+                { "openTodos", CountOpenTodos(info) },
                 { "changedRecords", changedRecords }
             });
         }
@@ -757,6 +810,67 @@ namespace WeChatSidekick.Backend
                 { "archivedInsights", archiveIds.Count },
                 { "profileFieldsUpdated", profileUpdates }
             });
+        }
+
+        private static void ApplyTodoResult(HttpListenerContext context, string contact, string contactDir, Dictionary<string, object> info, Dictionary<string, object> result)
+        {
+            int changed = ApplyTodoChanges(info, result);
+            info["todoExtractionVersion"] = "1";
+            SaveInfo(contactDir, info);
+            WriteJson(context, new Dictionary<string, object>
+            {
+                { "ok", true },
+                { "contact", contact },
+                { "type", "todo_extraction" },
+                { "openTodos", CountOpenTodos(info) },
+                { "changedTodos", changed }
+            });
+        }
+
+        private static int ApplyTodoChanges(Dictionary<string, object> info, Dictionary<string, object> result)
+        {
+            List<Dictionary<string, object>> todos = GetTodos(info);
+            HashSet<string> resolveIds = ToStringSet(GetArray(result, "resolveTodoIds"));
+            int changed = 0;
+            foreach (Dictionary<string, object> todo in todos)
+            {
+                if (resolveIds.Contains(GetString(todo, "id")) && GetString(todo, "status") == "open")
+                {
+                    todo["status"] = "done";
+                    todo["updatedAt"] = DateTime.Now.ToString("s");
+                    changed++;
+                }
+            }
+
+            foreach (Dictionary<string, object> todo in ToDictionaryList(GetArray(result, "newTodos")))
+            {
+                string title = NormalizeActorTokens(GetString(todo, "title")).Trim();
+                string status = GetString(todo, "status").ToLowerInvariant();
+                if (string.IsNullOrWhiteSpace(title)) continue;
+                if (status != "open" && status != "done" && status != "cancelled") status = "open";
+
+                bool duplicate = false;
+                foreach (Dictionary<string, object> existing in todos)
+                {
+                    if (GetString(existing, "title") == title && GetString(existing, "status") == status)
+                    {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (duplicate) continue;
+
+                todo["id"] = string.IsNullOrWhiteSpace(GetString(todo, "id")) ? "todo_" + Guid.NewGuid().ToString("N") : GetString(todo, "id");
+                todo["title"] = title;
+                todo["status"] = status;
+                todo["createdAt"] = DateTime.Now.ToString("s");
+                todo["updatedAt"] = DateTime.Now.ToString("s");
+                todos.Add(todo);
+                changed++;
+            }
+
+            info["todos"] = todos;
+            return changed;
         }
 
         private static List<Dictionary<string, object>> GetPendingVisibleRecords(List<Dictionary<string, object>> chat)
@@ -873,19 +987,25 @@ namespace WeChatSidekick.Backend
             {
                 string contact = Path.GetFileName(contactDir);
                 List<Dictionary<string, object>> chat = LoadChat(contactDir);
-                Dictionary<string, object> info = LoadInfo(contactDir);
                 contacts.Add(new Dictionary<string, object>
                 {
                     { "contact", contact },
-                    { "recordCount", chat.Count },
-                    { "insightCount", GetInsights(info).Count },
-                    { "threadCount", GetThreads(info).Count }
+                    { "recordCount", chat.Count }
                 });
             }
             return new Dictionary<string, object>
             {
                 { "contacts", contacts },
                 { "count", contacts.Count }
+            };
+        }
+
+        private static Dictionary<string, object> BuildTodosList()
+        {
+            return new Dictionary<string, object>
+            {
+                { "todos", new List<object>() },
+                { "openCount", 0 }
             };
         }
 
@@ -1088,6 +1208,37 @@ namespace WeChatSidekick.Backend
             return threads;
         }
 
+        private static List<Dictionary<string, object>> GetTodos(Dictionary<string, object> info)
+        {
+            List<Dictionary<string, object>> todos = new List<Dictionary<string, object>>();
+            object raw;
+            if (!info.TryGetValue("todos", out raw) || raw == null) return todos;
+            IEnumerable arr = raw as IEnumerable;
+            if (arr == null) return todos;
+
+            foreach (object item in arr)
+            {
+                Dictionary<string, object> todo = item as Dictionary<string, object>;
+                if (todo != null) todos.Add(todo);
+            }
+            return todos;
+        }
+
+        private static int CountOpenTodos(Dictionary<string, object> info)
+        {
+            return CountOpenTodos(GetTodos(info));
+        }
+
+        private static int CountOpenTodos(List<Dictionary<string, object>> todos)
+        {
+            int count = 0;
+            foreach (Dictionary<string, object> todo in todos)
+            {
+                if (GetString(todo, "status") == "open") count++;
+            }
+            return count;
+        }
+
         private static List<Dictionary<string, object>> ToDictionaryList(ArrayList arr)
         {
             List<Dictionary<string, object>> items = new List<Dictionary<string, object>>();
@@ -1256,7 +1407,11 @@ namespace WeChatSidekick.Backend
 
         private static void SaveChat(string contactDir, List<Dictionary<string, object>> chat)
         {
-            File.WriteAllText(Path.Combine(contactDir, "chat_history.json"), Serializer.Serialize(chat), new UTF8Encoding(false));
+            string path = Path.Combine(contactDir, "chat_history.json");
+            string temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            File.WriteAllText(temp, Serializer.Serialize(chat), new UTF8Encoding(false));
+            if (File.Exists(path)) File.Replace(temp, path, null);
+            else File.Move(temp, path);
         }
 
         private static void SaveInfo(string contactDir, Dictionary<string, object> info)
@@ -1274,6 +1429,7 @@ namespace WeChatSidekick.Backend
             info["wechatid"] = "";
             info["profile"] = new Dictionary<string, object>();
             info["insights"] = new object[0];
+            info["todos"] = new object[0];
             info["threads"] = new object[0];
             SaveInfo(contactDir, info);
         }
@@ -1287,7 +1443,31 @@ namespace WeChatSidekick.Backend
 
         private static string GetProfilesDir()
         {
-            return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "profiles");
+            return RecordsDir;
+        }
+
+        private static string ResolveRecordsDir()
+        {
+            string records = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "Stringem", "wechat-daemon", "records");
+            if (!Directory.Exists(records)) Directory.CreateDirectory(records);
+
+            string legacy = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "profiles");
+            if (Directory.Exists(legacy))
+            {
+                foreach (string legacyContactDir in Directory.GetDirectories(legacy))
+                {
+                    string source = Path.Combine(legacyContactDir, "chat_history.json");
+                    if (!File.Exists(source)) continue;
+                    string destinationDir = Path.Combine(records, Path.GetFileName(legacyContactDir));
+                    string destination = Path.Combine(destinationDir, "chat_history.json");
+                    if (File.Exists(destination)) continue;
+                    Directory.CreateDirectory(destinationDir);
+                    File.Copy(source, destination);
+                }
+            }
+            return records;
         }
 
         private static string GetContactDir(string chatName)

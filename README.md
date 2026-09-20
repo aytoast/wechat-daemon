@@ -21,6 +21,9 @@
 - 在文本信息不足时，用 screen capture 判断消息方向。
 - 按 contact 保存本地 records。
 - 将重叠 viewport 合并成稳定 message islands。
+- 每天设定时段内、电脑空闲至少 5 分钟时，遍历当前可见最近聊天并向上滚动补采历史 viewport。结束后恢复原聊天。左键 tray icon 打开 dashboard，可修改开始和结束时间。
+- dashboard 的 Run now 只扫描 session list 中今天或昨天有活动的聊天。也可运行 `wechat-daemon.exe --backfill-recent-now` 后退出。
+- 每个聊天完成历史补采后保存 viewport checkpoint。后续运行先比对最新 viewport；内容未变时跳过，内容变化时只向上扫描到已知边界。
 - 将 timestamp、call、media、system、gap 保存为 metadata records。
 - 提供 WebSocket tools，用于实时 WeChat automation。
 - 提供 HTTP endpoints，用于读取 contact records、处理 review jobs、写回语义结果。
@@ -33,7 +36,7 @@ visible WeChat UI
   -> Windows UI Automation
   -> screen capture
   -> viewport merge and repair
-  -> local profiles
+  -> local records
   -> HTTP / WebSocket API
 ```
 
@@ -84,14 +87,16 @@ build.bat
 输出：
 
 ```text
-wechat-backend.exe
+wechat-daemon.exe
 ```
 
 运行：
 
 ```bat
-wechat-backend.exe
+wechat-daemon.exe
 ```
+
+启动后服务驻留在 system tray，不显示 console window。右键 tray icon 可打开 local API 或退出服务。
 
 默认服务地址：
 
@@ -151,25 +156,19 @@ endpoints：
 - `GET /contacts/{contact}`
 - `GET /contacts/{contact}/chat-history`
 - `DELETE /contacts/{contact}/chat-history`
-- `PUT /contacts/{contact}/profile`
-- `PATCH /contacts/{contact}/insight`
-- `GET /jobs`
-- `GET /jobs/{id}`
-- `POST /jobs/{id}/result`
 
 ## 数据存储
 
-contact folder：
+records folder：
 
 ```text
-profiles/<contact>/
+%LOCALAPPDATA%\\Stringem\\wechat-daemon\\records\\<contact>\\
 ```
 
 files：
 
 ```text
 chat_history.json
-info.json
 snapshots/
 ```
 
@@ -207,24 +206,9 @@ seen:       c d e f g
 merged: a b c d e f g
 ```
 
-当两个已保存 islands 被新的 viewport 连接起来，daemon 会合并 islands，并将受影响的 message records 标记为 pending，等待 semantic review。
+当两个已保存 islands 被新的 viewport 连接起来，daemon 会合并 islands。semantic processing belongs to Sidekick.
 
-## semantic jobs
-
-`GET /jobs` 返回待处理 review work。
-
-job types：
-
-- `review:<contact>`：将 pending records 转成 profile updates 和 dated insights。
-- `consolidate:<contact>`：将相关 insights 合并成长期 threads。
-
-job result 必须通过下面的 endpoint 写入：
-
-```text
-POST /jobs/{id}/result
-```
-
-agents 不应直接编辑 `profiles/`、`chat_history.json` 或 `info.json`。
+agents 不应直接编辑 `chat_history.json`。
 
 ## 正确性原则
 
@@ -234,4 +218,3 @@ agents 不应直接编辑 `profiles/`、`chat_history.json` 或 `info.json`。
 - 每条持久化 insight 都保留 source record IDs。
 - 用户可见 summary 不保留 raw actor tokens。
 - destructive write 或 semantic write 前保存 snapshot。
-

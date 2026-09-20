@@ -35,9 +35,25 @@ the extracted insights must adhere to this exact json array format:
       "category": "职业与项目",
       "date": "yyyy-mm-dd from source record CapturedAt when present",
       "sourceRecordIds": ["rec_id_from_job_records"],
-      "highlightRecordIds": ["most_relevant_rec_id"]
+      "highlightRecordIds": ["most_relevant_rec_id"],
+      "mentionedEntities": [
+        {
+          "name": "person or organization named in this interaction",
+          "kind": "person|organization|group"
+        }
+      ]
     }
   ],
+  "newTodos": [
+    {
+      "title": "我需要执行的明确动作",
+      "status": "open",
+      "dueDate": "yyyy-mm-dd or empty",
+      "sourceInsightIds": ["ins_id"],
+      "sourceRecordIds": ["rec_id_from_job_records"]
+    }
+  ],
+  "resolveTodoIds": [],
   "markRecordIdsProcessed": ["rec_id_from_job_records"],
   "markRecordIdsSkipped": [],
   "profileUpdates": {}
@@ -53,6 +69,9 @@ the extracted insights must adhere to this exact json array format:
 - if a job contains purely meaningless banter, emojis, or very short logistical updates with no value, do not persist an insight. put those record ids in `markRecordIdsSkipped`.
 - do not analyze hidden metadata as content. records with `Type` values like `timestamp`, `media`, `call`, `system`, or `gap` are only ordering/context markers. `scripts/get_pending_chats.py` should hide or auto-process them.
 - profile vs insight routing MUST follow `docs/semantic_routing.md`.
+- todo is an actionable commitment for 我. create `newTodos` only when I owe a concrete follow-up, reply, delivery, payment, introduction, decision, or scheduled action. an insight may describe a promise or open loop without creating a todo.
+- capture people, organizations, and groups explicitly mentioned in a meaningful insight with `mentionedEntities`. include only entities supported by source records. this is source annotation, not identity resolution.
+- do not create a todo for facts, conversations, another person's private task, vague intentions, or a completed action. resolve an existing todo only with explicit completion or cancellation evidence.
 - profile is stable reusable context about the contact. insights are dated relationship history: what the contact did, what i did, what we discussed, promised, sent, planned, rejected, resolved, or left open.
 - if a stable contact fact appears inside a meaningful interaction, write both `profileUpdates` and `newInsights`.
 - mention my action when it is useful relationship memory, but write `我` / `对方`; never write raw actor tokens like `[me]`, `[other]`, or `[system]` in summaries.

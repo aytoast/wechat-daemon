@@ -7,12 +7,23 @@ route every extracted fact to exactly one durable home:
 - `profile`: stable facts about the contact.
 - `insights`: dated interaction history between me and the contact.
 - `threads`: consolidated multi-insight stories built from related insights.
+- `todos`: concrete, user-owned actions with an open, done, or cancelled state.
 
 ## core split
 
 `profile` answers: who is this person, what is true about them, what do they generally prefer, what persistent context should be remembered before future conversations.
 
 `insights` answers: what happened between us, what the contact did, what i did, what was discussed, promised, sent, asked, planned, rejected, resolved, or left open.
+
+`todos` answers: what do i personally need to do next, if anything.
+
+## todo rules
+
+create a todo only for a concrete action owed by me: reply, follow up, send, introduce, pay, decide, schedule, or deliver. attach source insight and record IDs.
+
+do not create todos from relationship history alone. another person's promise remains an insight until it creates a specific action for me. vague plans, facts, and completed actions are not todos.
+
+todo status is `open`, `done`, or `cancelled`. update status only with explicit evidence.
 
 ## profile rules
 
